@@ -57,7 +57,8 @@ body {
   height: 50px;
   bottom: 10px;
 }
-.card.is-active .card-fullname, .card.is-active .card-jobtitle {
+.card.is-active .card-fullname,
+.card.is-active .card-jobtitle {
   left: 86px;
   transform: none;
 }
@@ -209,10 +210,16 @@ body {
   outline: 0;
   border-bottom: 3px solid transparent;
 }
-.card-buttons button.is-active, .card-buttons button:hover {
+.card-buttons button.is-active,
+.card-buttons button:hover {
   color: #2b2c48;
   border-bottom: 3px solid #8a84ff;
-  background: linear-gradient(to bottom, rgba(127, 199, 231, 0) 0%, rgba(207, 204, 255, 0.2) 44%, rgba(211, 226, 255, 0.4) 100%);
+  background: linear-gradient(
+    to bottom,
+    rgba(127, 199, 231, 0) 0%,
+    rgba(207, 204, 255, 0.2) 44%,
+    rgba(211, 226, 255, 0.4) 100%
+  );
 }
 .card-section {
   display: none;
@@ -308,7 +315,11 @@ body {
 .contact-me {
   border: 0;
   outline: none;
-  background: linear-gradient(to right, rgba(83, 200, 239, 0.8) 0%, rgba(81, 106, 204, 0.8) 96%);
+  background: linear-gradient(
+    to right,
+    rgba(83, 200, 239, 0.8) 0%,
+    rgba(81, 106, 204, 0.8) 96%
+  );
   box-shadow: 0 4px 6px rgba(0, 0, 0, 0.15);
   color: #fff;
   padding: 12px 16px;
@@ -323,7 +334,7 @@ body {
 }
 
 .card::-webkit-scrollbar {
-    display: none;
+  display: none;
 }
 
 .card {
