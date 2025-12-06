@@ -12,8 +12,6 @@ type Section = 'about' | 'experience' | 'projects' | 'blog' | 'freela' | 'contac
 
 interface CardProps {
   aboutContent?: string
-  contactContent?: string
-  freelaContent?: string
   experiences: Experience[]
   projects: Project[]
   posts: Post[]
@@ -30,8 +28,6 @@ const SECTIONS: { id: Section; label: string; shortLabel: string }[] = [
 
 export function Card({
   aboutContent,
-  contactContent,
-  freelaContent,
   experiences,
   projects,
   posts,
