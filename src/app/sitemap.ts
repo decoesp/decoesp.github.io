@@ -1,11 +1,11 @@
-import { allPosts } from 'contentlayer/generated'
+import { getAllPosts } from '@/lib/mdx'
 import type { MetadataRoute } from 'next'
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const baseUrl = 'https://decoesp.github.io'
 
-  const posts = allPosts.map((post) => ({
-    url: `${baseUrl}${post.url}`,
+  const posts = getAllPosts().map((post) => ({
+    url: `${baseUrl}/blog/${post.slug}`,
     lastModified: new Date(post.date),
     changeFrequency: 'monthly' as const,
     priority: 0.7,
