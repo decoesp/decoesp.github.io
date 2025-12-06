@@ -1,3 +1,6 @@
+> 🔗 Caso você esteja vendo este README ao invés do site, acesse o portfólio em:
+> 👉 [decoesp-github-io.vercel.app](https://decoesp-github-io.vercel.app/)
+
 # André Filho - Portfolio
 
 Portfolio pessoal com design de card interativo, desenvolvido com Next.js 16, TypeScript, Tailwind CSS e MDX.
@@ -121,3 +124,4 @@ Deploys automáticos a cada push na `main`.
 ## Licença
 
 MIT
+
