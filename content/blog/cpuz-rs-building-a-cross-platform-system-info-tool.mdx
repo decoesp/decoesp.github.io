@@ -1,0 +1,1297 @@
+---
+title: "CPUZ-RS: Construindo uma Ferramenta Multiplataforma de Informações do Sistema em Rust"
+description: "Um mergulho profundo na arquitetura de uma ferramenta modular e testável de informações do sistema inspirada no CPU-Z usando o poderoso ecossistema Rust"
+date: "2024-12-08"
+author: "CPUZ-RS Team"
+tags: ["rust", "programacao-sistemas", "multiplataforma", "egui", "cli", "arquitetura", "sysinfo"]
+image: "/blog/cpuz-rs-cover.png"
+---
+
+# CPUZ-RS: Construindo uma Ferramenta Multiplataforma de Informações do Sistema em Rust
+
+Já se perguntou o que realmente está acontecendo dentro do seu computador? Frequências de CPU, uso de memória, temperaturas dos sensores... todas aquelas informações detalhadas de hardware que ferramentas como CPU-Z expõem no Windows. Neste post, vamos explorar como construímos o **CPUZ-RS**, uma ferramenta multiplataforma de informações do sistema escrita inteiramente em Rust, com interfaces CLI e GUI.
+
+## O Desafio
+
+Construir uma ferramenta de informações do sistema apresenta vários desafios interessantes:
+
+1. **Diversidade de Plataformas**: Windows, Linux e macOS expõem informações de hardware de formas diferentes
+2. **Normalização de Dados**: Dados brutos de diferentes fontes precisam ser unificados em estruturas consistentes
+3. **Atualizações em Tempo Real**: Informações do sistema mudam constantemente: frequências flutuam, temperaturas sobem
+4. **Experiência do Usuário**: Tanto usuários avançados (CLI) quanto usuários casuais (GUI) precisam ser atendidos
+5. **APIs Nativas de Plataforma**: Cada SO requer abordagens específicas: `/proc` e `/sys` no Linux, WMI/PowerShell no Windows, `sysctl` e `ioreg` no macOS
+
+Nosso objetivo era criar uma ferramenta que:
+- Funcione perfeitamente em todos os principais sistemas operacionais
+- Forneça interfaces CLI e GUI a partir de uma base de código compartilhada
+- Seja modular, testável e manutenível
+- Siga as melhores práticas e padrões idiomáticos do Rust
+- Ofereça coletores específicos de plataforma para dados de hardware mais ricos
+
+## Visão Geral da Arquitetura
+
+Escolhemos uma estrutura de **Cargo Workspace** para organizar o projeto em crates focados e reutilizáveis:
+
+```
+cpuz-rs/
+├── Cargo.toml          # Configuração do workspace
+├── core/               # Modelos compartilhados, traits e coletor multiplataforma
+│   └── src/
+│       ├── models.rs   # Estruturas de dados (SystemReport, CpuInfo, etc.)
+│       ├── traits.rs   # Definições de traits dos coletores
+│       ├── collector.rs # Implementação multiplataforma baseada em sysinfo
+│       └── error.rs    # Tipos de erro customizados
+├── cli/                # Interface de linha de comando (clap)
+├── gui/                # Interface gráfica (egui/eframe)
+│   └── src/
+│       ├── app.rs      # Estado principal da aplicação
+│       ├── panels.rs   # Painéis de UI para cada seção
+│       └── theme.rs    # Tema escuro customizado
+├── platform/
+│   ├── linux/          # Coletores específicos do Linux (/proc, /sys, hwmon)
+│   ├── windows/        # Coletores específicos do Windows (WMI/PowerShell)
+│   └── macos/          # Coletores específicos do macOS (sysctl, ioreg, system_profiler)
+```
+
+Esta separação oferece vários benefícios:
+
+- **Core** contém estruturas de dados agnósticas de plataforma, traits e um coletor fallback baseado em `sysinfo`
+- **Módulos de plataforma** implementam coletores nativos para cada SO com detalhes de hardware mais ricos
+- **CLI e GUI** consomem a mesma API core, garantindo consistência
+- **Dependências do workspace** são centralizadas no `Cargo.toml` raiz para consistência de versões
+
+### A Biblioteca Core
+
+O coração do CPUZ-RS é o crate `cpuz-core`. Ele define nossos modelos de domínio e os contratos que implementações específicas de plataforma devem cumprir.
+
+```rust
+// Modelos de dados core com informações de tipo ricas
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SystemReport {
+    pub timestamp: Option<DateTime<Utc>>,
+    pub cpu: CpuInfo,
+    pub memory: MemoryInfo,
+    pub os: OsInfo,
+    pub motherboard: MotherboardInfo,
+    pub sensors: SensorInfo,
+    pub storage: Vec<StorageInfo>,
+}
+
+impl SystemReport {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn to_json_compact(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+// Informações abrangentes da CPU
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CpuInfo {
+    pub vendor: String,
+    pub brand: String,
+    pub physical_cores: u32,
+    pub logical_cores: u32,
+    pub threads_per_core: u32,
+    pub base_frequency_mhz: u64,
+    pub current_frequency_mhz: u64,
+    pub max_frequency_mhz: u64,
+    pub architecture: String,
+    pub cache_l2: Option<u64>,
+    pub cache_l3: Option<u64>,
+    pub features: Vec<String>,
+}
+
+impl CpuInfo {
+    pub fn frequency_ghz(&self) -> f64 {
+        self.current_frequency_mhz as f64 / 1000.0
+    }
+}
+```
+
+#### Abstração Baseada em Traits
+
+Cada tipo de coletor é definido como uma trait, permitindo implementações específicas de plataforma:
+
+```rust
+pub trait CpuCollector {
+    fn collect_cpu_info(&self) -> Result<CpuInfo>;
+}
+
+pub trait MemoryCollector {
+    fn collect_memory_info(&self) -> Result<MemoryInfo>;
+}
+
+pub trait SensorCollector {
+    fn collect_sensor_info(&self) -> Result<SensorInfo>;
+}
+
+// Trait composta com implementação padrão
+pub trait SystemInfoCollector:
+    CpuCollector + MemoryCollector + OsCollector + 
+    MotherboardCollector + SensorCollector + StorageCollector
+{
+    fn collect_all(&self) -> Result<SystemReport> {
+        Ok(SystemReport {
+            timestamp: Some(chrono::Utc::now()),
+            cpu: self.collect_cpu_info()?,
+            memory: self.collect_memory_info()?,
+            os: self.collect_os_info()?,
+            motherboard: self.collect_motherboard_info()?,
+            sensors: self.collect_sensor_info()?,
+            storage: self.collect_storage_info()?,
+        })
+    }
+}
+```
+
+Este design segue o **Princípio da Inversão de Dependência**: módulos de alto nível (CLI, GUI) dependem de abstrações (traits), não de implementações concretas. A trait `SystemInfoCollector` fornece uma implementação padrão de `collect_all()` que orquestra todos os coletores.
+
+### Coletores Específicos de Plataforma
+
+Cada plataforma tem sua própria forma de expor informações do sistema:
+
+#### Linux: O Sistema de Arquivos `/proc` e `/sys`
+
+O Linux expõe informações de hardware através de sistemas de arquivos virtuais. O crate `cpuz-linux` fornece coletores especializados que fazem parsing desses arquivos com tratamento robusto de erros.
+
+**Informações da CPU de `/proc/cpuinfo`:**
+
+```rust
+pub struct LinuxCpuCollector {
+    proc_path: String,
+}
+
+impl LinuxCpuCollector {
+    pub fn parse_cpuinfo(content: &str) -> Result<CpuInfo> {
+        let mut cpu_info = CpuInfo::default();
+        let mut processors: Vec<HashMap<String, String>> = Vec::new();
+        let mut current_processor: HashMap<String, String> = HashMap::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                if !current_processor.is_empty() {
+                    processors.push(current_processor.clone());
+                    current_processor.clear();
+                }
+                continue;
+            }
+
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim().to_lowercase();
+                let value = value.trim().to_string();
+                current_processor.insert(key, value);
+            }
+        }
+
+        // Extrair vendor, brand, cores, frequência e recursos da CPU
+        let first = &processors[0];
+        cpu_info.vendor = first.get("vendor_id").cloned().unwrap_or_default();
+        cpu_info.brand = first.get("model name").cloned().unwrap_or_default();
+        
+        // Fazer parsing das flags da CPU para detecção de recursos
+        if let Some(flags) = first.get("flags") {
+            cpu_info.features = flags.split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+        }
+
+        Ok(cpu_info)
+    }
+}
+```
+
+**Sensores de Temperatura de `/sys/class/thermal/` e `/sys/class/hwmon/`:**
+
+```rust
+pub struct LinuxSensorCollector {
+    thermal_path: String,
+    hwmon_path: String,
+}
+
+impl LinuxSensorCollector {
+    fn read_thermal_zones(&self) -> Vec<TemperatureReading> {
+        let mut readings = Vec::new();
+        let thermal_path = Path::new(&self.thermal_path);
+
+        if let Ok(entries) = fs::read_dir(thermal_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                if !name.starts_with("thermal_zone") {
+                    continue;
+                }
+
+                let temp_path = path.join("temp");
+                let type_path = path.join("type");
+
+                let label = fs::read_to_string(&type_path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| name.clone());
+
+                if let Ok(temp_str) = fs::read_to_string(&temp_path) {
+                    if let Ok(temp_millicelsius) = temp_str.trim().parse::<i64>() {
+                        let temp_celsius = temp_millicelsius as f32 / 1000.0;
+
+                        // Ler limite de temperatura crítica
+                        let trip_path = path.join("trip_point_0_temp");
+                        let critical = fs::read_to_string(&trip_path)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<i64>().ok())
+                            .map(|t| t as f32 / 1000.0);
+
+                        readings.push(TemperatureReading {
+                            label,
+                            temperature_celsius: temp_celsius,
+                            critical_celsius: critical,
+                        });
+                    }
+                }
+            }
+        }
+        readings
+    }
+
+    fn read_hwmon_sensors(&self) -> (Vec<TemperatureReading>, Vec<FanReading>) {
+        // Lê de /sys/class/hwmon/hwmon*/temp*_input e fan*_input
+        // Suporta até 16 sensores por dispositivo hwmon
+        // ...
+    }
+}
+```
+
+#### Windows: WMI via PowerShell
+
+O Windows fornece a interface Windows Management Instrumentation (WMI). O crate `cpuz-windows` acessa através de comandos PowerShell com saída JSON para parsing fácil:
+
+```rust
+// wmi.rs - Helper de execução de comandos PowerShell
+pub fn run_powershell_command(command: &str) -> Result<String> {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(CpuzError::CollectionError(
+            String::from_utf8_lossy(&output.stderr).to_string()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// processor.rs - Informações da CPU via Win32_Processor
+pub struct WindowsCpuCollector;
+
+impl CpuCollector for WindowsCpuCollector {
+    fn collect_cpu_info(&self) -> Result<CpuInfo> {
+        let command = r#"
+            Get-CimInstance Win32_Processor | 
+            Select-Object Manufacturer, Name, NumberOfCores, 
+                          NumberOfLogicalProcessors, MaxClockSpeed,
+                          L2CacheSize, L3CacheSize | 
+            ConvertTo-Json
+        "#;
+
+        let output = wmi::run_powershell_command(command)?;
+        let json: serde_json::Value = serde_json::from_str(&output)?;
+
+        Ok(CpuInfo {
+            vendor: json["Manufacturer"].as_str().unwrap_or("Unknown").to_string(),
+            brand: json["Name"].as_str().unwrap_or("Unknown").to_string(),
+            physical_cores: json["NumberOfCores"].as_u64().unwrap_or(1) as u32,
+            logical_cores: json["NumberOfLogicalProcessors"].as_u64().unwrap_or(1) as u32,
+            base_frequency_mhz: json["MaxClockSpeed"].as_u64().unwrap_or(0),
+            cache_l2: json["L2CacheSize"].as_u64().map(|kb| kb * 1024),
+            cache_l3: json["L3CacheSize"].as_u64().map(|kb| kb * 1024),
+            // ...
+        })
+    }
+}
+
+// Informações do SO via Win32_OperatingSystem
+impl OsCollector for WindowsSystemCollector {
+    fn collect_os_info(&self) -> Result<OsInfo> {
+        let output = wmi::run_powershell_command(
+            "Get-CimInstance Win32_OperatingSystem | \
+             Select-Object Caption, Version, BuildNumber, CSName | ConvertTo-Json"
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&output)?;
+
+        // Calcular uptime a partir de LastBootUpTime
+        let uptime_output = wmi::run_powershell_command(
+            "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime | \
+             ForEach-Object { [int]((Get-Date) - $_).TotalSeconds }"
+        ).unwrap_or_else(|_| "0".to_string());
+
+        Ok(OsInfo {
+            name: json["Caption"].as_str().unwrap_or("Windows").to_string(),
+            version: json["Version"].as_str().unwrap_or("Unknown").to_string(),
+            kernel_version: json["BuildNumber"].as_str().unwrap_or("Unknown").to_string(),
+            hostname: json["CSName"].as_str().unwrap_or("Unknown").to_string(),
+            uptime_seconds: uptime_output.trim().parse().unwrap_or(0),
+            // ...
+        })
+    }
+}
+```
+
+#### macOS: sysctl, ioreg e system_profiler
+
+O macOS fornece várias ferramentas de linha de comando para acessar informações do sistema. O crate `cpuz-macos` usa uma combinação de `sysctl`, `ioreg` e `system_profiler`, com tratamento especial para Apple Silicon:
+
+```rust
+// sysctl.rs - Informações principais do sistema
+pub struct MacOsSysctlCollector;
+
+impl MacOsSysctlCollector {
+    fn run_sysctl(&self, key: &str) -> Option<String> {
+        Command::new("sysctl")
+            .arg("-n")
+            .arg(key)
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn run_sysctl_int(&self, key: &str) -> Option<u64> {
+        self.run_sysctl(key).and_then(|s| s.parse().ok())
+    }
+
+    fn is_apple_silicon(&self) -> bool {
+        std::env::consts::ARCH == "aarch64"
+    }
+
+    fn get_cpu_vendor(&self) -> String {
+        self.run_sysctl("machdep.cpu.vendor")
+            .unwrap_or_else(|| {
+                // Para Apple Silicon, não há string de vendor
+                if self.is_apple_silicon() {
+                    "Apple".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            })
+    }
+
+    pub fn get_uptime(&self) -> Result<u64> {
+        // sysctl kern.boottime retorna: { sec = 1234567890, usec = 0 }
+        if let Some(boottime_str) = self.run_sysctl("kern.boottime") {
+            if let Some(sec_start) = boottime_str.find("sec = ") {
+                let sec_str = &boottime_str[sec_start + 6..];
+                if let Some(sec_end) = sec_str.find(',') {
+                    if let Ok(boot_sec) = sec_str[..sec_end].trim().parse::<u64>() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        return Ok(now.saturating_sub(boot_sec));
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }
+}
+
+impl CpuCollector for MacOsSysctlCollector {
+    fn collect_cpu_info(&self) -> Result<CpuInfo> {
+        let physical_cores = self.run_sysctl_int("hw.physicalcpu")
+            .or_else(|| self.run_sysctl_int("machdep.cpu.core_count"))
+            .unwrap_or(1) as u32;
+
+        let logical_cores = self.run_sysctl_int("hw.logicalcpu")
+            .or_else(|| self.run_sysctl_int("machdep.cpu.thread_count"))
+            .unwrap_or(1) as u32;
+
+        let frequency = self.run_sysctl_int("hw.cpufrequency")
+            .map(|hz| hz / 1_000_000) // Convert Hz to MHz
+            .unwrap_or(0);
+
+        Ok(CpuInfo {
+            vendor: self.get_cpu_vendor(),
+            brand: self.run_sysctl("machdep.cpu.brand_string")
+                .unwrap_or_else(|| "Unknown".to_string()),
+            physical_cores,
+            logical_cores,
+            threads_per_core: logical_cores / physical_cores.max(1),
+            base_frequency_mhz: frequency,
+            cache_l2: self.run_sysctl_int("hw.l2cachesize"),
+            cache_l3: self.run_sysctl_int("hw.l3cachesize"),
+            // ...
+        })
+    }
+}
+
+impl MemoryCollector for MacOsSysctlCollector {
+    fn collect_memory_info(&self) -> Result<MemoryInfo> {
+        let total_bytes = self.run_sysctl_int("hw.memsize").unwrap_or(0);
+        let (used_bytes, available_bytes) = self.get_memory_usage(total_bytes);
+
+        Ok(MemoryInfo {
+            total_bytes,
+            used_bytes,
+            available_bytes,
+            memory_type: if self.is_apple_silicon() {
+                Some("Unified Memory".to_string())
+            } else {
+                None
+            },
+            // ...
+        })
+    }
+}
+```
+
+**Detalhes de hardware via `system_profiler`:**
+
+```rust
+// system_profiler.rs - Informações detalhadas de hardware
+pub struct MacOsSystemProfiler;
+
+impl MotherboardCollector for MacOsSystemProfiler {
+    fn collect_motherboard_info(&self) -> Result<MotherboardInfo> {
+        // Usa SPHardwareDataType para modelo, serial, etc.
+        let output = Command::new("system_profiler")
+            .arg("SPHardwareDataType")
+            .output()?;
+        // Fazer parsing da saída para Model Name, Serial Number, etc.
+    }
+}
+```
+
+### O Fallback Multiplataforma
+
+Para máxima compatibilidade, a biblioteca core fornece um `SystemCollector` que usa o excelente crate `sysinfo` (v0.31). Isso serve tanto como fallback quanto como coletor principal para informações de armazenamento e sensores:
+
+```rust
+use sysinfo::{Components, Disks, System};
+
+pub struct SystemCollector {
+    system: System,
+}
+
+impl SystemCollector {
+    pub fn new() -> Self {
+        Self {
+            system: System::new_all(),
+        }
+    }
+
+    pub fn refresh(&mut self) {
+        self.system.refresh_all();
+    }
+
+    pub fn get_system_report(&mut self) -> Result<SystemReport> {
+        self.refresh();
+        self.collect_all()
+    }
+}
+
+impl CpuCollector for SystemCollector {
+    fn collect_cpu_info(&self) -> Result<CpuInfo> {
+        let cpus = self.system.cpus();
+        let first_cpu = &cpus[0];
+        let physical_cores = self.system.physical_core_count().unwrap_or(0) as u32;
+        let logical_cores = cpus.len() as u32;
+
+        Ok(CpuInfo {
+            vendor: first_cpu.vendor_id().to_string(),
+            brand: first_cpu.brand().to_string(),
+            physical_cores,
+            logical_cores,
+            threads_per_core: if physical_cores > 0 {
+                logical_cores / physical_cores
+            } else { 1 },
+            current_frequency_mhz: cpus.iter().map(|c| c.frequency()).max().unwrap_or(0),
+            architecture: std::env::consts::ARCH.to_string(),
+            // ...
+        })
+    }
+}
+
+impl SensorCollector for SystemCollector {
+    fn collect_sensor_info(&self) -> Result<SensorInfo> {
+        let components = Components::new_with_refreshed_list();
+        let mut cpu_temps: Vec<TemperatureReading> = Vec::new();
+        let mut main_cpu_temp: Option<f32> = None;
+
+        for component in &components {
+            let label = component.label().to_string();
+            let temp = component.temperature();
+            let critical = component.critical();
+
+            if label.to_lowercase().contains("cpu")
+                || label.to_lowercase().contains("core")
+                || label.to_lowercase().contains("package")
+            {
+                if main_cpu_temp.is_none() || label.to_lowercase().contains("package") {
+                    main_cpu_temp = Some(temp);
+                }
+
+                cpu_temps.push(TemperatureReading {
+                    label,
+                    temperature_celsius: temp,
+                    critical_celsius: critical,
+                });
+            }
+        }
+
+        Ok(SensorInfo {
+            cpu_temperature_celsius: main_cpu_temp,
+            cpu_temperatures: cpu_temps,
+            fan_speeds: Vec::new(),
+            voltages: Vec::new(),
+        })
+    }
+}
+
+impl StorageCollector for SystemCollector {
+    fn collect_storage_info(&self) -> Result<Vec<StorageInfo>> {
+        let disks = Disks::new_with_refreshed_list();
+        let mut storage_list = Vec::new();
+
+        for disk in &disks {
+            let storage_type = match disk.kind() {
+                sysinfo::DiskKind::SSD => StorageType::SSD,
+                sysinfo::DiskKind::HDD => StorageType::HDD,
+                _ => {
+                    let name = disk.name().to_string_lossy().to_lowercase();
+                    if name.contains("nvme") {
+                        StorageType::NVMe
+                    } else {
+                        StorageType::Unknown
+                    }
+                }
+            };
+
+            storage_list.push(StorageInfo {
+                name: disk.name().to_string_lossy().to_string(),
+                mount_point: disk.mount_point().to_string_lossy().to_string(),
+                file_system: disk.file_system().to_string_lossy().to_string(),
+                total_bytes: disk.total_space(),
+                used_bytes: disk.total_space().saturating_sub(disk.available_space()),
+                storage_type,
+                is_removable: disk.is_removable(),
+            });
+        }
+
+        Ok(storage_list)
+    }
+}
+```
+
+Isso nos dá uma implementação funcional em todas as plataformas, enquanto módulos específicos de plataforma podem fornecer dados mais ricos quando disponíveis (como detalhes de slots de memória, informações de BIOS e velocidades de ventiladores).
+
+## Construindo a CLI
+
+A CLI usa `clap` (v4.5) para parsing de argumentos, fornecendo uma interface limpa e descobrível com recursos ricos:
+
+```rust
+#[derive(Parser, Debug)]
+#[command(
+    name = "cpuz-cli",
+    author,
+    version,
+    about = "A cross-platform system information tool inspired by CPU-Z",
+    long_about = "cpuz-cli collects and displays detailed information about your \
+                  system including CPU, memory, OS, motherboard, sensors, and storage."
+)]
+struct Args {
+    #[arg(long, help = "Output in JSON format")]
+    json: bool,
+
+    #[arg(long, short = 'r', value_name = "SECONDS",
+          help = "Refresh interval in seconds (continuous mode)")]
+    refresh: Option<u64>,
+
+    #[arg(long, short = 'c', help = "Compact JSON output (single line)",
+          requires = "json")]
+    compact: bool,
+
+    #[arg(long, short = 's', value_enum, help = "Show only specific section")]
+    section: Option<Section>,
+
+    #[arg(long, short = 'o', value_name = "FILE", help = "Output to file")]
+    output: Option<String>,
+
+    #[arg(long, short = 'p',
+          help = "Wait for Enter key before exiting (useful on Windows)")]
+    pause: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum Section {
+    Cpu,
+    Memory,
+    Os,
+    Motherboard,
+    Sensors,
+    Storage,
+}
+```
+
+**Detecção de Duplo Clique no Windows:**
+
+Uma melhoria de UX interessante: detectar automaticamente quando a CLI é iniciada por duplo clique no Windows:
+
+```rust
+fn should_auto_pause() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleProcessList;
+
+        let mut process_list: [u32; 2] = [0; 2];
+        let count = unsafe { GetConsoleProcessList(process_list.as_mut_ptr(), 2) };
+
+        // Se apenas 1 processo (nós mesmos), provavelmente foi duplo clique
+        // Um terminal teria pelo menos 2 (shell + nosso processo)
+        count == 1
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    { false }
+}
+```
+
+**Exemplos de uso:**
+
+```bash
+# Saída legível por humanos
+$ cpuz-cli
+
+╔════════════════════════════════════════════════════════════╗
+║                    CPUZ-RS System Report                    ║
+╚════════════════════════════════════════════════════════════╝
+
+┌─ CPU ──────────────────────────────────────────────────────
+│ Vendor:          GenuineIntel
+│ Model:           Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz
+│ Architecture:    x86_64
+│ Physical Cores:  8
+│ Logical Cores:   16
+│ Threads/Core:    2
+│ Base Frequency:  3.80 GHz
+│ Current Freq:    3.80 GHz
+│ L2 Cache:        2048 KB
+│ L3 Cache:        16 MB
+└────────────────────────────────────────────────────────────
+
+# Saída JSON para scripts
+$ cpuz-cli --json | jq '.cpu.brand'
+"Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz"
+
+# JSON compacto para piping
+$ cpuz-cli --json --compact > report.json
+
+# Mostrar apenas seção específica
+$ cpuz-cli --section memory
+$ cpuz-cli --section sensors
+
+# Monitoramento contínuo com refresh de 2 segundos
+$ cpuz-cli --refresh 2
+
+# Exportar para arquivo
+$ cpuz-cli --json --output system_report.json
+```
+
+## Construindo a GUI com egui
+
+Para a interface gráfica, escolhemos **egui** (v0.29) com **eframe**, uma biblioteca GUI de modo imediato que é:
+- Rust puro sem dependências nativas (além de OpenGL)
+- Multiplataforma pronta para uso
+- Rápida e leve
+
+```rust
+// app.rs - Estado principal da aplicação
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Cpu,
+    Memory,
+    Os,
+    Motherboard,
+    Sensors,
+    Storage,
+}
+
+pub struct CpuzApp {
+    collector: SystemCollector,
+    report: Option<SystemReport>,
+    current_tab: Tab,
+    auto_refresh: bool,
+    refresh_interval: f32,
+    last_refresh: Instant,
+    status_message: Option<(String, Instant)>,
+}
+
+impl CpuzApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::setup_custom_fonts(&cc.egui_ctx);
+        theme::apply_theme(&cc.egui_ctx);
+
+        let mut collector = SystemCollector::new();
+        let report = collector.get_system_report().ok();
+
+        Self {
+            collector,
+            report,
+            current_tab: Tab::Cpu,
+            auto_refresh: false,
+            refresh_interval: 2.0,
+            last_refresh: Instant::now(),
+            status_message: None,
+        }
+    }
+
+    fn export_json(&mut self) {
+        if let Some(ref report) = self.report {
+            if let Ok(json) = report.to_json() {
+                // Usa rfd (Rust File Dialog) para seletor de arquivos nativo
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .set_file_name("system_report.json")
+                    .save_file()
+                {
+                    match std::fs::write(&path, &json) {
+                        Ok(_) => self.set_status(&format!("Exported to {:?}", path)),
+                        Err(e) => self.set_status(&format!("Export failed: {}", e)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for CpuzApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Lógica de auto-refresh
+        if self.auto_refresh {
+            if self.last_refresh.elapsed() >= Duration::from_secs_f32(self.refresh_interval) {
+                self.refresh_data();
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        // Barra de ferramentas superior
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("🖥️ CPUZ-RS");
+                ui.separator();
+                if ui.button("🔄 Refresh").clicked() {
+                    self.refresh_data();
+                }
+                if ui.button("💾 Export JSON").clicked() {
+                    self.export_json();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
+                if self.auto_refresh {
+                    ui.add(egui::Slider::new(&mut self.refresh_interval, 1.0..=10.0)
+                        .text("sec"));
+                }
+            });
+        });
+
+        // Barra de status
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some((ref msg, time)) = self.status_message {
+                    if time.elapsed() < Duration::from_secs(5) {
+                        ui.label(msg);
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("Last refresh: {:.1}s ago",
+                        self.last_refresh.elapsed().as_secs_f32()));
+                });
+            });
+        });
+
+        // Barra lateral de navegação por abas
+        egui::SidePanel::left("tab_panel")
+            .resizable(false)
+            .default_width(120.0)
+            .show(ctx, |ui| {
+                let tabs = [
+                    (Tab::Cpu, "🔲 CPU"),
+                    (Tab::Memory, "💾 Memory"),
+                    (Tab::Os, "🖥️ OS"),
+                    (Tab::Motherboard, "🔌 Motherboard"),
+                    (Tab::Sensors, "🌡️ Sensors"),
+                    (Tab::Storage, "💿 Storage"),
+                ];
+
+                for (tab, label) in tabs {
+                    if ui.selectable_label(self.current_tab == tab, label).clicked() {
+                        self.current_tab = tab;
+                    }
+                }
+            });
+
+        // Área de conteúdo principal
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if let Some(ref report) = self.report {
+                    match self.current_tab {
+                        Tab::Cpu => panels::cpu_panel(ui, &report.cpu),
+                        Tab::Memory => panels::memory_panel(ui, &report.memory),
+                        Tab::Os => panels::os_panel(ui, &report.os),
+                        Tab::Motherboard => panels::motherboard_panel(ui, &report.motherboard),
+                        Tab::Sensors => panels::sensors_panel(ui, &report.sensors),
+                        Tab::Storage => panels::storage_panel(ui, &report.storage),
+                    }
+                }
+            });
+        });
+    }
+}
+```
+
+**Tema Escuro Customizado:**
+
+```rust
+// theme.rs - Tema escuro profissional
+pub fn apply_theme(ctx: &egui::Context) {
+    let mut style = Style::default();
+    let mut visuals = Visuals::dark();
+
+    visuals.window_fill = Color32::from_rgb(25, 25, 30);
+    visuals.panel_fill = Color32::from_rgb(30, 30, 35);
+    visuals.faint_bg_color = Color32::from_rgb(40, 40, 45);
+
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(70, 130, 180);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(100, 180, 255);
+    visuals.selection.bg_fill = Color32::from_rgb(70, 130, 180);
+
+    visuals.hyperlink_color = Color32::from_rgb(100, 180, 255);
+    visuals.window_rounding = Rounding::same(8.0);
+
+    style.visuals = visuals;
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+
+    ctx.set_style(style);
+}
+```
+
+**Painel de Sensores com Temperaturas Codificadas por Cores:**
+
+```rust
+// panels.rs - Exibição de temperatura com feedback visual
+pub fn sensors_panel(ui: &mut Ui, sensors: &SensorInfo) {
+    if let Some(cpu_temp) = sensors.cpu_temperature_celsius {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("CPU Temperature:").strong().size(18.0));
+
+            let color = if cpu_temp > 80.0 {
+                Color32::RED
+            } else if cpu_temp > 60.0 {
+                Color32::YELLOW
+            } else {
+                Color32::GREEN
+            };
+
+            ui.label(RichText::new(format!("{:.1}°C", cpu_temp))
+                .size(18.0)
+                .color(color));
+        });
+    }
+    // ... grade de temperatura com limites críticos
+}
+```
+
+A GUI possui:
+- **Navegação por abas** para diferentes seções do sistema (CPU, Memória, SO, Placa-mãe, Sensores, Armazenamento)
+- **Refresh em tempo real** com intervalos configuráveis (1-10 segundos)
+- **Exportação JSON** com diálogo de arquivo nativo
+- **Tema escuro customizado** com estilo profissional
+- **Indicadores de temperatura codificados por cores** (verde/amarelo/vermelho baseado em limites)
+- **Barras de progresso** para uso de memória e armazenamento
+- **Seções recolhíveis** para recursos da CPU
+
+## Estratégia de Testes
+
+Testar ferramentas de informações do sistema é complicado: você não pode mockar o hardware real. Nossa abordagem combina testes unitários com dados mock, testes de integração e testes condicionais por plataforma.
+
+### 1. Testes Unitários com Dados Mock
+
+Testamos a lógica de parsing com dados mock que simulam saída real do sistema. Os testes do coletor de CPU do Linux são um bom exemplo:
+
+```rust
+const MOCK_CPUINFO: &str = r#"
+processor	: 0
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 158
+model name	: Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz
+stepping	: 10
+cpu MHz		: 3700.000
+cache size	: 12288 KB
+physical id	: 0
+siblings	: 12
+core id		: 0
+cpu cores	: 6
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr avx avx2
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz
+cpu MHz		: 3700.000
+physical id	: 0
+cpu cores	: 6
+"#;
+
+#[test]
+fn test_parse_cpuinfo() {
+    let result = LinuxCpuCollector::parse_cpuinfo(MOCK_CPUINFO);
+    assert!(result.is_ok());
+
+    let cpu = result.unwrap();
+    assert_eq!(cpu.vendor, "GenuineIntel");
+    assert!(cpu.brand.contains("i7-8700K"));
+    assert_eq!(cpu.physical_cores, 6);
+    assert_eq!(cpu.logical_cores, 2); // Two processors in mock
+    assert_eq!(cpu.current_frequency_mhz, 3700);
+    assert!(cpu.features.contains(&"avx2".to_string()));
+}
+
+#[test]
+fn test_parse_empty_cpuinfo() {
+    let result = LinuxCpuCollector::parse_cpuinfo("");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cache_size_parsing() {
+    let result = LinuxCpuCollector::parse_cpuinfo(MOCK_CPUINFO).unwrap();
+    assert_eq!(result.cache_l3, Some(12288 * 1024)); // Convertido para bytes
+}
+```
+
+**Testes de Sensores com Diretórios Temporários:**
+
+```rust
+use tempfile::TempDir;
+
+fn create_mock_thermal_zone(dir: &Path, zone_num: u32, type_name: &str, temp: i64) {
+    let zone_path = dir.join(format!("thermal_zone{}", zone_num));
+    fs::create_dir_all(&zone_path).unwrap();
+    fs::write(zone_path.join("type"), type_name).unwrap();
+    fs::write(zone_path.join("temp"), temp.to_string()).unwrap();
+}
+
+#[test]
+fn test_read_thermal_zones() {
+    let temp_dir = TempDir::new().unwrap();
+    let thermal_path = temp_dir.path().join("thermal");
+    fs::create_dir_all(&thermal_path).unwrap();
+
+    create_mock_thermal_zone(&thermal_path, 0, "x86_pkg_temp", 45000);
+    create_mock_thermal_zone(&thermal_path, 1, "acpitz", 35000);
+
+    let collector = LinuxSensorCollector::with_paths(
+        thermal_path.to_str().unwrap(),
+        "/nonexistent",
+    );
+
+    let readings = collector.read_thermal_zones();
+    assert_eq!(readings.len(), 2);
+
+    let pkg_temp = readings.iter().find(|r| r.label == "x86_pkg_temp");
+    assert!(pkg_temp.is_some());
+    assert!((pkg_temp.unwrap().temperature_celsius - 45.0).abs() < 0.1);
+}
+```
+
+### 2. Testes Unitários de Modelos
+
+Testando métodos auxiliares e cálculos:
+
+```rust
+#[test]
+fn test_memory_info_calculations() {
+    let mem = MemoryInfo {
+        total_bytes: 16_000_000_000,
+        used_bytes: 8_000_000_000,
+        available_bytes: 8_000_000_000,
+        ..Default::default()
+    };
+
+    assert!((mem.total_gb() - 14.9).abs() < 0.1);
+    assert!((mem.usage_percent() - 50.0).abs() < 0.1);
+}
+
+#[test]
+fn test_cpu_frequency_conversion() {
+    let cpu = CpuInfo {
+        current_frequency_mhz: 3600,
+        base_frequency_mhz: 3200,
+        ..Default::default()
+    };
+
+    assert!((cpu.frequency_ghz() - 3.6).abs() < 0.01);
+    assert!((cpu.base_frequency_ghz() - 3.2).abs() < 0.01);
+}
+
+#[test]
+fn test_uptime_formatting() {
+    let os = OsInfo {
+        uptime_seconds: 90061, // 1d 1h 1m 1s
+        ..Default::default()
+    };
+
+    assert_eq!(os.uptime_formatted(), "1d 1h 1m 1s");
+}
+
+#[test]
+fn test_storage_type_display() {
+    assert_eq!(StorageType::SSD.to_string(), "SSD");
+    assert_eq!(StorageType::NVMe.to_string(), "NVMe");
+}
+```
+
+### 3. Testes de Integração Condicionais por Plataforma
+
+```rust
+#[test]
+#[cfg(target_os = "linux")]
+fn test_linux_collector_integration() {
+    let collector = LinuxSystemCollector::new();
+    let result = collector.collect_cpu_info();
+    assert!(result.is_ok() || true); // Pode falhar no CI sem /proc
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_macos_collector_integration() {
+    let collector = MacOsSystemCollector::new();
+    let result = collector.collect_cpu_info();
+    assert!(result.is_ok());
+    let cpu = result.unwrap();
+    assert!(cpu.physical_cores > 0);
+}
+
+#[test]
+fn test_full_system_report() {
+    let mut collector = SystemCollector::new();
+    let result = collector.get_system_report();
+    assert!(result.is_ok());
+}
+```
+
+## Pipeline CI/CD
+
+Nosso workflow do GitHub Actions garante qualidade em todas as plataformas com releases automatizados:
+
+**Workflow de Release (`.github/workflows/release.yml`):**
+
+```yaml
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release:
+    name: Build Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cli_name: cpuz-cli
+            gui_name: cpuz-gui
+            asset_suffix: linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cli_name: cpuz-cli.exe
+            gui_name: cpuz-gui.exe
+            asset_suffix: windows-amd64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cli_name: cpuz-cli
+            gui_name: cpuz-gui
+            asset_suffix: macos-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cli_name: cpuz-cli
+            gui_name: cpuz-gui
+            asset_suffix: macos-arm64  # Suporte a Apple Silicon!
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Build release
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.cli_name }} \
+             dist/cpuz-cli-${{ matrix.asset_suffix }}
+          cp target/${{ matrix.target }}/release/${{ matrix.gui_name }} \
+             dist/cpuz-gui-${{ matrix.asset_suffix }}
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-release:
+    name: Create Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Este workflow:
+- Compila para **4 targets**: Linux x64, Windows x64, macOS x64 e macOS ARM64 (Apple Silicon)
+- Instala dependências específicas de plataforma (GTK para GUI no Linux)
+- Empacota binários CLI e GUI
+- Cria automaticamente releases no GitHub com notas de release geradas
+
+## Principais Aprendizados
+
+### 1. Abstração Compensa
+
+Ao definir traits na biblioteca core, podemos:
+- Trocar implementações sem alterar consumidores
+- Testar com coletores mock usando injeção de dependência (ex: `LinuxSensorCollector::with_paths()`)
+- Adicionar novas plataformas sem modificar código existente
+- Fornecer defaults sensatos via fallback baseado em `sysinfo`
+
+### 2. sysinfo é Excelente, Mas Limitado
+
+O crate `sysinfo` (v0.31) fornece ótimos básicos multiplataforma para:
+- Uso e frequência de CPU
+- Uso de memória
+- Informações de disco
+- Sensores de temperatura
+
+No entanto, para informações detalhadas de hardware (slots de memória, versão de BIOS, recursos de CPU, velocidades de ventiladores), código específico de plataforma é necessário. Nossa abordagem em camadas usa `sysinfo` como base enquanto módulos de plataforma adicionam profundidade.
+
+### 3. egui está Pronto para Produção
+
+Apesar de ser "modo imediato", egui (v0.29) lida bem com UIs complexas:
+- Temas customizados com `Visuals` e `Style`
+- Layouts responsivos com painéis e grids
+- Diálogos de arquivo nativos via `rfd`
+- Aparência consistente entre plataformas
+
+### 4. Parsing é a Parte Difícil
+
+A maior parte da complexidade não está em coletar dados, mas sim em fazer parsing dos inúmeros formatos que cada SO usa:
+- Linux `/proc/cpuinfo` usa pares chave-valor separados por tab
+- Windows WMI retorna JSON (quando usando `ConvertTo-Json`)
+- macOS `sysctl` tem vários formatos de saída incluindo estruturas aninhadas
+
+Tratamento robusto de erros e defaults sensatos são essenciais. Usamos `unwrap_or_default()` e tipos `Option` extensivamente.
+
+### 5. Detecção de Plataforma Importa
+
+Usar `#[cfg(target_os = "...")]` para compilação condicional mantém binários enxutos. A estrutura de workspace permite que crates de plataforma sejam compilados apenas quando necessário.
+
+### 6. Testabilidade Através de Injeção
+
+Tornar caminhos configuráveis (ex: `LinuxCpuCollector::with_path()`) permite testar com dados mock sem tocar no sistema de arquivos real.
+
+## Resumo da Stack Tecnológica
+
+**Principais dependências utilizadas no projeto:**
+
+- **Info do Sistema:** `sysinfo` 0.31
+- **Parser CLI:** `clap` 4.5
+- **Framework GUI:** `egui` / `eframe` 0.29
+- **Serialização:** `serde` / `serde_json` 1.0
+- **Tratamento de Erros:** `thiserror` 2.0
+- **Data/Hora:** `chrono` 0.4
+- **Runtime Async:** `tokio` 1.42
+
+## Próximos Passos
+
+O roadmap inclui:
+- **Informações de GPU** via APIs específicas de plataforma (NVML, Metal, etc.)
+- **Detalhes de interface de rede**
+- **Status de bateria** para laptops
+- **Gráficos de monitoramento de hardware** com dados históricos
+- **Ferramentas de benchmark do sistema**
+- **Exportação para HTML/PDF**
+- **Suporte a localização**
+- **Interface web** usando WASM
+
+## Conclusão
+
+Construir o CPUZ-RS demonstrou os pontos fortes do Rust para programação de sistemas:
+- **Segurança de memória** sem sacrificar performance
+- **Excelente ecossistema** (sysinfo, egui, clap, serde, chrono)
+- **Multiplataforma** desde o primeiro dia com compilação condicional
+- **Tipagem forte** captura erros em tempo de compilação
+- **Cargo workspaces** permitem arquitetura modular limpa
+
+A arquitetura baseada em traits garante que o projeto possa crescer mantendo-se manutenível. Seja para uma verificação rápida via CLI ou um dashboard GUI completo, o CPUZ-RS tem você coberto.
+
+---
+
+**Experimente você mesmo:**
+
+```bash
+git clone https://github.com/yourusername/cpuz-rs.git
+cd cpuz-rs
+
+# Executar a CLI
+cargo run -p cpuz-cli
+
+# Executar a CLI com saída JSON
+cargo run -p cpuz-cli -- --json
+
+# Executar a GUI
+cargo run -p cpuz-gui
+
+# Executar todos os testes
+cargo test --workspace
+```
+
+**Dependências Linux:**
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
+    libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+```
+
+*Achou útil? Dê uma estrela no repo e contribua!*

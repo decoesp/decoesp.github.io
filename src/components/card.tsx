@@ -247,21 +247,23 @@ export function Card({
               {posts.length > 0 ? (
                 <ul className="space-y-4">
                   {posts.map((post) => (
-                    <li key={post.slug} className="pb-4 border-b border-gray-100 last:border-0">
+                    <li key={post.slug} className="border-b border-gray-100 last:border-0">
                       <Link
                         href={`/blog/${post.slug}`}
-                        className="font-semibold text-sm text-card-text hover:text-primary transition-colors"
+                        className="block pb-4 hover:bg-gray-50 transition-colors rounded-lg -mx-2 px-2 py-2"
                       >
-                        {post.title}
+                        <span className="font-semibold text-sm text-card-text">
+                          {post.title}
+                        </span>
+                        <span className="block text-[11px] text-gray-400 mt-1">
+                          {format(new Date(post.date), "d 'de' MMMM, yyyy", {
+                            locale: ptBR,
+                          })}
+                        </span>
+                        <p className="text-xs text-card-muted mt-1 leading-relaxed">
+                          {post.description}
+                        </p>
                       </Link>
-                      <span className="block text-[11px] text-gray-400 mt-1">
-                        {format(new Date(post.date), "d 'de' MMMM, yyyy", {
-                          locale: ptBR,
-                        })}
-                      </span>
-                      <p className="text-xs text-card-muted mt-1 leading-relaxed">
-                        {post.description}
-                      </p>
                     </li>
                   ))}
                 </ul>
